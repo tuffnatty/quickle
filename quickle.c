@@ -8,6 +8,14 @@ PyDoc_STRVAR(quickle__doc__,
 
 #define QUICKLE_VERSION "0.4.0"
 
+#if PY_VERSION_HEX < 0x030a0000
+#define PyFloat_Pack8(x, p, le) _PyFloat_Pack8((x), (unsigned char *)(p), (le))
+#define PyFloat_Unpack8(s, le) _PyFloat_Unpack8((unsigned char *)(s), (le))
+#else
+PyAPI_FUNC(int) _PySet_Update(PyObject *set, PyObject *iterable);
+PyAPI_FUNC(int) _PyUnicode_Equal(PyObject *, PyObject *);
+#endif
+
 enum opcode {
     MARK             = '(',
     STOP             = '.',
@@ -161,8 +169,12 @@ find_keyword(PyObject *kwnames, PyObject *const *kwstack, PyObject *key)
 
     for (i = 0; i < nkwargs; i++) {
         PyObject *kwname = PyTuple_GET_ITEM(kwnames, i);
+#if PY_VERSION_HEX >= 0x030d0000
+        if (_PyUnicode_Equal(kwname, key)) {
+#else
         assert(PyUnicode_Check(kwname));
         if (_PyUnicode_EQ(kwname, key)) {
+#endif
             return kwstack[i];
         }
     }
@@ -432,7 +444,11 @@ StructMeta_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
     ((PyTypeObject *)cls)->tp_vectorcall = (vectorcallfunc)Struct_vectorcall;
     Py_CLEAR(new_args);
 
+#if PY_VERSION_HEX < 0x030c0000
     PyMemberDef *mp = PyHeapType_GET_MEMBERS(cls);
+#else
+    PyMemberDef *mp = (PyMemberDef *)PyObject_GetItemData((PyObject *)cls);
+#endif
     for (i = 0; i < Py_SIZE(cls); i++, mp++) {
         offset = PyLong_FromSsize_t(mp->offset);
         if (offset == NULL)
@@ -1521,9 +1537,15 @@ save_long(EncoderObject *self, PyObject *obj)
     if (repr == NULL)
         goto error;
     pdata = (unsigned char *)PyBytes_AS_STRING(repr);
+#if PY_VERSION_HEX < 0x030d0000
     i = _PyLong_AsByteArray((PyLongObject *)obj,
                             pdata, nbytes,
                             1 /* little endian */ , 1 /* signed */ );
+#else
+    i = _PyLong_AsByteArray((PyLongObject *)obj,
+                            pdata, nbytes,
+                            1 /* little endian */ , 1 /* signed */, 1 /* with_exceptions */ );
+#endif
     if (i < 0)
         goto error;
     /* If the int is negative, this may be a byte more than
@@ -1571,7 +1593,7 @@ save_float(EncoderObject *self, PyObject *obj)
 
     char pdata[9];
     pdata[0] = BINFLOAT;
-    if (_PyFloat_Pack8(x, (unsigned char *)&pdata[1], 0) < 0)
+    if (PyFloat_Pack8(x, &pdata[1], 0) < 0)
         return -1;
     if (_Encoder_Write(self, pdata, 9) < 0)
         return -1;
@@ -1583,9 +1605,9 @@ save_complex(EncoderObject *self, PyObject *obj)
 {
     char pdata[17];
     pdata[0] = COMPLEX;
-    if (_PyFloat_Pack8(PyComplex_RealAsDouble(obj), (unsigned char *)&pdata[1], 0) < 0)
+    if (PyFloat_Pack8(PyComplex_RealAsDouble(obj), &pdata[1], 0) < 0)
         return -1;
-    if (_PyFloat_Pack8(PyComplex_ImagAsDouble(obj), (unsigned char *)&pdata[9], 0) < 0)
+    if (PyFloat_Pack8(PyComplex_ImagAsDouble(obj), &pdata[9], 0) < 0)
         return -1;
     if (_Encoder_Write(self, pdata, 17) < 0)
         return -1;
@@ -2233,8 +2255,7 @@ save_set(EncoderObject *self, PyObject *obj, int memoize)
 {
     PyObject *item;
     int i;
-    Py_ssize_t set_size, ppos = 0;
-    Py_hash_t hash;
+    Py_ssize_t set_size;
 
     const char empty_set_op = EMPTY_SET;
     const char mark_op = MARK;
@@ -2250,26 +2271,46 @@ save_set(EncoderObject *self, PyObject *obj, int memoize)
     if (set_size == 0)
         return 0;  /* nothing to do */
 
+#if PY_VERSION_HEX >= 0x030d0000
+    PyObject *iter = PyObject_GetIter(obj);
+    if (iter == NULL) {
+        return -1;
+    }
+#else
+    Py_ssize_t ppos = 0;
+    Py_hash_t hash;
+#endif
     /* Write in batches of BATCHSIZE. */
     do {
         i = 0;
         if (_Encoder_Write(self, &mark_op, 1) < 0)
-            return -1;
+            goto error;
+#if PY_VERSION_HEX >= 0x030d0000
+        while ((item = PyIter_Next(iter)) != NULL) {
+            /* Convert to borrowed reference, enables refcnt optimization */
+            Py_DECREF(item);
+#else
         while (_PySet_NextEntry(obj, &ppos, &item, &hash)) {
+#endif
             if (save(self, item, memoize) < 0)
-                return -1;
+                goto error;
             if (++i == BATCHSIZE)
                 break;
         }
         if (_Encoder_Write(self, &additems_op, 1) < 0)
-            return -1;
+            goto error;
         if (PySet_GET_SIZE(obj) != set_size) {
             PyErr_Format(
                 PyExc_RuntimeError,
                 "set changed size during iteration");
+error:
+	    Py_DECREF(iter);
             return -1;
         }
     } while (i == BATCHSIZE);
+#if PY_VERSION_HEX >= 0x030d0000
+    Py_DECREF(iter);
+#endif
 
     return 0;
 }
@@ -3476,7 +3517,7 @@ load_binfloat(DecoderObject *self)
     if (_Decoder_Read(self, &s, 8) < 0)
         return -1;
 
-    x = _PyFloat_Unpack8((unsigned char *)s, 0);
+    x = PyFloat_Unpack8(s, 0);
     if (x == -1.0 && PyErr_Occurred())
         return -1;
 
@@ -3497,10 +3538,10 @@ load_complex(DecoderObject *self)
     if (_Decoder_Read(self, &s, 16) < 0)
         return -1;
 
-    real = _PyFloat_Unpack8((unsigned char *)s, 0);
+    real = PyFloat_Unpack8(s, 0);
     if (real == -1.0 && PyErr_Occurred())
         return -1;
-    imag = _PyFloat_Unpack8((unsigned char *)(s + 8), 0);
+    imag = PyFloat_Unpack8((s + 8), 0);
     if (imag == -1.0 && PyErr_Occurred())
         return -1;
 
@@ -4949,5 +4990,8 @@ PyInit_quickle(void)
     if (st->name_str == NULL)
         return NULL;
 
+#ifdef Py_GIL_DISABLED
+    PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED);
+#endif
     return m;
 }
